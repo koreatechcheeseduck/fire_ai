@@ -1,0 +1,29 @@
+# Fire ML Project (v2)
+
+## 0) 가상환경 & 패키지
+```bash
+python -m venv .venv
+.\.venv\Scriptsctivate
+pip install -r requirements.txt
+```
+
+## 1) 데이터 스키마 정렬
+```bash
+python scripts/align_schema.py --input data/raw/학습데이터.csv --output data/raw/fire_incidents_aligned.csv
+```
+
+## 2) 모델 학습 (원인/발화 지점 멀티헤드 RandomForest)
+```bash
+python -m src.train_model --input data/raw/fire_incidents_aligned.csv --outdir models/rf_v1
+```
+
+## 3) 유사사례 인덱스 생성 (TF-IDF)
+```bash
+python scripts/build_index.py --input data/processed/dataset.parquet --outdir models/index_v1
+```
+
+## 4) API 실행
+```bash
+uvicorn api.app:app --reload
+```
+브라우저: http://127.0.0.1:8000/docs  → `/predict` 테스트
