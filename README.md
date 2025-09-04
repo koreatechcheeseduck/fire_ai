@@ -2,8 +2,9 @@
 
 ## 0) 가상환경 & 패키지
 ```bash
-python -m venv .venv
-.\.venv\Scriptsctivate
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
@@ -22,8 +23,7 @@ python -m src.train_model --input data/raw/fire_incidents_aligned.csv --outdir m
 python scripts/build_index.py --input data/processed/dataset.parquet --outdir models/index_v1
 ```
 
-## 4) API 실행
+## 4) 테스트 실행
 ```bash
-uvicorn api.app:app --reload
+python scripts/run_local.py --pretty
 ```
-브라우저: http://127.0.0.1:8000/docs  → `/predict` 테스트
