@@ -1,29 +1,35 @@
 # -*- coding: utf-8 -*-
 """
-각 타깃별로 학습된 scikit-learn 파이프라인(.joblib)을 ONNX로 변환합니다.
-- ColumnTransformer의 수치/범주 컬럼 구성을 모델에서 직접 추출
-- 그에 맞춘 dtype의 샘플 DataFrame으로 to_onnx 호출 (dtype 혼동 방지)
-- 분류기는 zipmap=False 로 확률을 텐서로 출력
-- 각 타깃의 라벨 파일(*.labels.json)도 함께 저장
-
-사용:
-    python scripts/export_onnx_per_target.py --model_dir models/rf_v1 --out_dir models/onnx_v1 --opset 17
+타깃별 ONNX 내보내기 (ColumnTransformer 컬럼명 스키마 + 문자열 Imputer 제거 + CT 탐색 버그 수정)
+- 파이프라인: [ preprocess(ColumnTransformer) -> (RF clf/reg) ]
+- 변환 시:
+  1) 정제 CSV의 dtype으로 컬럼별 initial_types 생성(컬럼명 기반)  ← DataFrame을 컬럼들로 본다
+  2) cat 파이프라인의 '문자형 SimpleImputer' 제거(ONNX-ML 미지원) ← 공식 예제 권장
+  3) 분류기는 zipmap=False(확률 벡터)
+참고: https://onnx.ai/sklearn-onnx/auto_examples/plot_complex_pipeline.html
 """
 
 from __future__ import annotations
+
 import argparse
-import json
-import sys
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import joblib
-import numpy as np
 import pandas as pd
-from skl2onnx import to_onnx
+from sklearn.base import ClassifierMixin
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
 
-# ---- 프로젝트 내부의 입력 피처 정의를 쓰되, 실패 시 로컬 fallback ----
-DEFAULT_INPUT_FEATURES: List[str] = [
+from skl2onnx import convert_sklearn
+from skl2onnx.common.data_types import (
+    FloatTensorType,
+    Int64TensorType,
+    StringTensorType,
+)
+
+# === 프로젝트 입력 피처(순서 유지) ===
+INPUT_FEATURES: List[str] = [
     "building_agreement_count",
     "building_structure",
     "building_usage_status",
@@ -44,231 +50,210 @@ DEFAULT_INPUT_FEATURES: List[str] = [
     "wind_direction",
 ]
 
-def _load_input_features() -> List[str]:
+
+# -------------------------------
+# 유틸
+# -------------------------------
+def _is_ct(obj: Any) -> bool:
+    """ColumnTransformer 판별 (isinstance + duck-typing)."""
     try:
-        # 루트에서 실행할 때 import 가능
-        from src.infer_model import INPUT_FEATURES  # type: ignore
-        if isinstance(INPUT_FEATURES, list) and INPUT_FEATURES:
-            return INPUT_FEATURES
+        from sklearn.compose import ColumnTransformer  # local import
+        if isinstance(obj, ColumnTransformer):
+            return True
     except Exception:
         pass
-    return DEFAULT_INPUT_FEATURES
+    return hasattr(obj, "transformers") and obj.__class__.__name__ == "ColumnTransformer"
 
 
-def _find_column_transformer(pipe) -> Tuple[Optional[object], Optional[List[str]], Optional[List[str]]]:
+def _iter_estimators(est) -> Iterable[Any]:
     """
-    파이프라인에서 ColumnTransformer와 그 안의 수치/범주 컬럼 목록을 찾아서 반환.
-    - 우선 'preprocess'/'preprocessor' 스텝을 찾고, 없으면 첫 번째 ColumnTransformer를 탐색
+    파이프라인/CT 내부 추정기를 깊이 순회.
+    (중요) '자기 자신'도 먼저 yield 한 뒤 내부로 들어간다. ← 이전 버그 수정
     """
-    ct = None
-    num_cols: Optional[List[str]] = None
-    cat_cols: Optional[List[str]] = None
+    # 자신 먼저
+    yield est
 
-    if hasattr(pipe, "named_steps"):
-        # 흔한 이름 우선 탐색
-        for key in ("preprocess", "preprocessor"):
-            if key in pipe.named_steps:
-                maybe = pipe.named_steps[key]
-                if maybe.__class__.__name__ == "ColumnTransformer":
-                    ct = maybe
-                    break
-
-        # 못 찾았으면 전체 스텝에서 ColumnTransformer 검색
-        if ct is None:
-            for obj in pipe.named_steps.values():
-                if obj.__class__.__name__ == "ColumnTransformer":
-                    ct = obj
-                    break
-
-    # column 목록 가져오기
-    if ct is not None and hasattr(ct, "transformers_"):
-        for name, trans, cols in ct.transformers_:
-            # passthrough 도 존재할 수 있으니 검사
-            if cols is None or cols == "remainder":
-                continue
-            # 흔히 num/cat 라는 이름을 씁니다.
-            if isinstance(cols, list):
-                if name.lower().startswith("num"):
-                    num_cols = cols
-                elif name.lower().startswith("cat"):
-                    cat_cols = cols
-
-        # 이름이 특이한 경우, 타입으로 추정 (숫자 imputer/원핫 유무)
-        if (num_cols is None or cat_cols is None) and hasattr(ct, "transformers_"):
-            tmp_num, tmp_cat = [], []
-            for name, trans, cols in ct.transformers_:
-                if cols is None or cols == "remainder":
-                    continue
-                if isinstance(cols, list):
-                    # 간단 추정: OneHotEncoder가 들어있는 transformer는 범주
-                    has_ohe = False
-                    if hasattr(trans, "named_steps"):
-                        for v in trans.named_steps.values():
-                            if v.__class__.__name__ == "OneHotEncoder":
-                                has_ohe = True
-                                break
-                    if has_ohe:
-                        tmp_cat.extend(cols)
-                    else:
-                        tmp_num.extend(cols)
-            if num_cols is None and tmp_num:
-                num_cols = tmp_num
-            if cat_cols is None and tmp_cat:
-                cat_cols = tmp_cat
-
-    return ct, num_cols, cat_cols
+    # 내부 순회
+    if isinstance(est, Pipeline):
+        for _, sub in est.steps:
+            yield from _iter_estimators(sub)
+    elif _is_ct(est):
+        for _, trans, _ in getattr(est, "transformers", []):
+            if trans is not None and trans != "drop":
+                yield from _iter_estimators(trans)
 
 
-def _build_sample_df(all_cols: List[str], num_cols: List[str], cat_cols: List[str]) -> pd.DataFrame:
+def _find_ct(est) -> Optional[Any]:
+    """어디든 박혀 있는 ColumnTransformer 하나를 찾아 반환."""
+    for sub in _iter_estimators(est):
+        if _is_ct(sub):
+            return sub
+    return None
+
+
+def _remove_string_imputer_in_cat(ct) -> None:
     """
-    변환용 더미 DataFrame 생성 (dtype 엄격히 설정).
-    - 수치 컬럼: float64 (0.0)
-    - 범주 컬럼: object (빈 문자열)
-    - 나머지 컬럼: object (빈 문자열)
+    ColumnTransformer의 cat 파이프라인에서 '문자형 SimpleImputer' 스텝 제거.
+    (숫자 Imputer는 유지)  ← ONNX-ML이 문자열 Imputer 미지원이라 변환 시 제거 권장
     """
-    data: Dict[str, object] = {}
-    num_set = set(num_cols)
-    cat_set = set(cat_cols)
-    for c in all_cols:
-        if c in num_set:
-            data[c] = np.array([0.0], dtype=np.float64)
+    from sklearn.pipeline import Pipeline as SKPipeline
+
+    def _strip_in_pipeline(pipe: SKPipeline):
+        new_steps = []
+        for name, tr in pipe.steps:
+            if isinstance(tr, SimpleImputer):
+                # fill_value가 문자열(None 포함) => 문자형으로 간주 → 제거
+                fv = getattr(tr, "fill_value", None)
+                if fv is None or isinstance(fv, str):
+                    continue  # drop this step
+            new_steps.append((name, tr))
+        pipe.steps = new_steps  # in-place
+
+    # 원본 정의(transformers) 처리
+    for i, (name, trans, cols) in enumerate(list(ct.transformers)):
+        if name == "cat" and isinstance(trans, SKPipeline):
+            _strip_in_pipeline(trans)
+
+    # fit 이후 내부(transformers_) 처리
+    if hasattr(ct, "transformers_"):
+        new_trs_ = []
+        for t in ct.transformers_:
+            name = t[0]
+            trans = t[1]
+            if name == "cat" and isinstance(trans, SKPipeline):
+                _strip_in_pipeline(trans)
+            new_trs_.append(t)
+        ct.transformers_ = new_trs_
+
+
+def _convert_dataframe_schema(df: pd.DataFrame, keep_cols: List[str]):
+    """
+    DataFrame을 '컬럼들의 집합'으로 보고, 각 컬럼명/타입을 ONNX initial_types로 매핑.
+    (int64 -> Int64TensorType, float64 -> FloatTensorType, 그 외 -> StringTensorType)
+    """
+    init = []
+    for c in keep_cols:
+        if c not in df.columns:
+            init.append((c, StringTensorType([None, 1])))
+            continue
+        dt = df[c].dtype
+        if pd.api.types.is_integer_dtype(dt):
+            init.append((c, Int64TensorType([None, 1])))
+        elif pd.api.types.is_float_dtype(dt):
+            init.append((c, FloatTensorType([None, 1])))
         else:
-            # 범주 + 기타 모두 object(str)
-            data[c] = np.array([""], dtype=object)
-    df = pd.DataFrame(data, columns=all_cols)
-    # 안전하게 dtype 캐스팅(특히 object 유지)
-    for c in num_cols:
-        df[c] = df[c].astype(np.float64)
-    for c in cat_cols:
-        df[c] = df[c].astype(object)
-    return df
+            init.append((c, StringTensorType([None, 1])))
+    return init
 
 
-def _is_classifier(final_estimator) -> bool:
-    # 일반적으로 분류기는 predict_proba 존재
-    return hasattr(final_estimator, "predict_proba")
-
-
-def _export_labels_if_any(model_path: Path, out_path_noext: Path):
-    """
-    같은 디렉터리에 존재하는 라벨 파일을 찾아 함께 저장.
-    - 규칙: <target>_labels.joblib, 또는 파이프라인 최종추정기의 classes_
-    """
-    # 1) *_labels.joblib 찾기
-    labels_candidates = list(model_path.parent.glob("*labels.joblib"))
-    by_target: Dict[str, List[str]] = {}
-    for p in labels_candidates:
-        try:
-            obj = joblib.load(p)
-            # dict[str, list] 또는 list 로 저장된 경우를 모두 지원
-            if isinstance(obj, dict):
-                for k, v in obj.items():
-                    if isinstance(v, (list, np.ndarray)):
-                        by_target[k] = list(v)
-            elif isinstance(obj, (list, np.ndarray)):
-                # 파일명이 '<target>_labels.joblib' 라고 가정
-                tgt_name = p.stem.replace("_labels", "")
-                by_target[tgt_name] = list(obj)
-        except Exception:
-            pass
-
-    # 2) 파이프라인 자체에서 classes_ 추정
-    try:
-        pipe = joblib.load(model_path)
-        final_est = getattr(pipe, "named_steps", {}).get("model", None)
-        if final_est is None:
-            # 마지막 스텝이 model이라고 가정 못하는 경우, 마지막 스텝 사용
-            if hasattr(pipe, "named_steps") and pipe.named_steps:
-                final_est = list(pipe.named_steps.values())[-1]
-        if final_est is not None and hasattr(final_est, "classes_"):
-            # 어느 타깃인지 추정
-            tgt = model_path.stem.replace("_rf", "")
-            by_target.setdefault(tgt, list(map(lambda x: str(x), list(final_est.classes_))))
-    except Exception:
-        pass
-
-    # 저장
-    for tgt, labels in by_target.items():
-        out_json = out_path_noext.parent / f"{tgt}.labels.json"
-        try:
-            out_json.write_text(json.dumps({"labels": labels}, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass
-
-
-def export_per_target(model_dir: str, out_dir: str, opset: int = 17):
-    model_dir_p = Path(model_dir)
-    out_dir_p = Path(out_dir)
-    out_dir_p.mkdir(parents=True, exist_ok=True)
-
-    jobs = sorted(model_dir_p.glob("*.joblib"))
-    # rf, gb, etc 모두 포함될 수 있으니 *.joblib 필터링
-    for job_path in jobs:
-        tgt = job_path.stem.replace("_rf", "")  # 학습 스크립트에서 *_rf.joblib로 저장했다면 이 규칙으로 타깃 추정
-        out_onnx = out_dir_p / f"{tgt}.onnx"
-
-        print(f"[INFO] convert {tgt} -> {out_onnx}")
-        pipe = joblib.load(job_path)
-
-        # ColumnTransformer & 컬럼 목록 추출
-        ct, num_cols, cat_cols = _find_column_transformer(pipe)
-        if ct is None or num_cols is None or cat_cols is None:
-            # 최후 수단: infer_model 정의 or fallback
-            all_cols = _load_input_features()
-            # 단순 기준으로 나눔 (숫자형 후보)
-            default_num = {
-                "building_agreement_count", "total_floor_area", "soot_area",
-                "unit_temperature", "unit_humidity", "unit_wind_speed", "total_floor_count"
-            }
-            num_cols = [c for c in all_cols if c in default_num]
-            cat_cols = [c for c in all_cols if c not in default_num]
+def _discover_targets(model_dir: Path) -> Dict[str, Path]:
+    out: Dict[str, Path] = {}
+    for p in model_dir.glob("*.joblib"):
+        name = p.stem
+        if name.endswith("_rf"):
+            tgt = name[:-3]
+        elif name.endswith("_clf") or name.endswith("_reg"):
+            tgt = name.rsplit("_", 1)[0]
         else:
-            # ColumnTransformer에서 사용되는 컬럼만 사용
-            all_cols = list(dict.fromkeys([*num_cols, *cat_cols]))
-
-        # 샘플 DF (정확한 dtype 설정)
-        df = _build_sample_df(all_cols, num_cols, cat_cols)
-
-        # 분류기/회귀기 옵션
-        final_est = getattr(pipe, "named_steps", {}).get("model", None)
-        if final_est is None and hasattr(pipe, "named_steps") and pipe.named_steps:
-            final_est = list(pipe.named_steps.values())[-1]
-
-        onnx_options = {}
-        if final_est is not None and _is_classifier(final_est):
-            # 분류기: zipmap=False 로 확률을 텐서로
-            onnx_options = {id(final_est): {"zipmap": False}}
-
-        # 변환 (DataFrame을 직접 넘겨 dtype 혼란 제거)
-        onx = to_onnx(
-            pipe,
-            df,
-            target_opset=opset,
-            options=onnx_options,
-        )
-
-        with open(out_onnx, "wb") as f:
-            f.write(onx.SerializeToString())
-
-        # 라벨 저장(있으면)
-        _export_labels_if_any(job_path, out_onnx.with_suffix(""))
-
-    print("[DONE] ONNX per-target export completed.")
+            continue
+        out[tgt] = p
+    return out
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_dir", required=True, help="학습된 파이프라인(.joblib)들이 있는 디렉토리")
-    parser.add_argument("--out_dir", required=True, help="ONNX를 저장할 디렉토리")
-    parser.add_argument("--opset", type=int, default=17, help="ONNX opset (기본 17)")
-    args = parser.parse_args()
+def _is_classifier(model) -> bool:
+    last = model.steps[-1][1] if isinstance(model, Pipeline) else model
+    return isinstance(last, ClassifierMixin) or hasattr(last, "predict_proba")
+
+
+# -------------------------------
+# 메인 변환
+# -------------------------------
+def export_per_target(model_dir: Path, out_dir: Path, schema_csv: Optional[Path], opset: int) -> int:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    targets = _discover_targets(model_dir)
+    if not targets:
+        print(f"[WARN] 모델을 찾지 못했습니다: {model_dir}")
+        return 1
+
+    # 스키마용 DataFrame 로드 (정제 CSV 권장)
+    df_schema = None
+    if schema_csv is not None and schema_csv.exists():
+        df_schema_full = pd.read_csv(schema_csv, nrows=200)
+        cols = [c for c in INPUT_FEATURES if c in df_schema_full.columns]
+        df_schema = df_schema_full[cols].copy()
+        print(f"[INFO] schema_csv loaded: {schema_csv} (cols={list(df_schema.columns)})")
+    else:
+        print("[INFO] schema_csv not provided; will create schema from names only.")
+
+    # 컬럼명 기반 initial_types 생성
+    if df_schema is not None and len(df_schema.columns) > 0:
+        initial_types = _convert_dataframe_schema(df_schema, INPUT_FEATURES)
+    else:
+        initial_types = [(c, StringTensorType([None, 1])) for c in INPUT_FEATURES]
+
+    print(f"[INFO] initial_types count = {len(initial_types)}")
+    print(f"[INFO] 발견된 타깃({len(targets)}): {', '.join(sorted(targets.keys()))}")
+
+    failed: List[Tuple[str, str]] = []
+
+    for tgt, joblib_path in sorted(targets.items()):
+        out_path = out_dir / f"{tgt}.onnx"
+        print(f"[INFO] convert {tgt} -> {out_path}")
+
+        try:
+            model = joblib.load(joblib_path)
+
+            # 1) ColumnTransformer 확보(이제 제대로 잡힘)
+            ct = _find_ct(model)
+            if ct is None:
+                raise RuntimeError("파이프라인에 ColumnTransformer가 없습니다.")
+
+            # 2) cat 파이프라인의 '문자형 SimpleImputer' 제거 (ONNX 호환)
+            _remove_string_imputer_in_cat(ct)
+
+            # 3) 분류기 zipmap 옵션
+            options = {id(model): {"zipmap": False}} if _is_classifier(model) else None
+
+            # 4) 변환 (컬럼명 기반 initial_types만 사용)
+            onx = convert_sklearn(
+                model,
+                name=f"{tgt}_pipeline",
+                initial_types=initial_types,
+                target_opset=opset,
+                options=options,
+            )
+            with open(out_path, "wb") as f:
+                f.write(onx.SerializeToString())
+
+        except Exception as e:
+            msg = str(e)
+            print(f"[ERROR] {tgt}: {msg}")
+            failed.append((tgt, msg))
+
+    if failed:
+        print("\n[SUMMARY] 변환 실패 타깃:")
+        for tgt, msg in failed:
+            print(f"  - {tgt}: {msg}")
+        return 1
+
+    print("[DONE] 모든 타깃 ONNX 변환 완료:", out_dir)
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model_dir", required=True, help="학습된 joblib 파이프라인 폴더")
+    ap.add_argument("--out_dir", required=True, help="ONNX 출력 폴더")
+    ap.add_argument("--schema_csv", default="data/raw/fire_incidents_aligned.csv",
+                    help="입력 컬럼 dtype 추출용 CSV(정제본). 없으면 이름만으로 스키마 생성")
+    ap.add_argument("--opset", type=int, default=17)
+    args = ap.parse_args()
 
     print(f"[INFO] model_dir = {args.model_dir}")
     print(f"[INFO] out_dir   = {args.out_dir}")
     print(f"[INFO] opset     = {args.opset}")
-
-    export_per_target(args.model_dir, args.out_dir, args.opset)
+    return export_per_target(Path(args.model_dir), Path(args.out_dir), Path(args.schema_csv), args.opset)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
