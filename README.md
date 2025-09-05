@@ -2,9 +2,9 @@
 
 ## 0) 가상환경 & 패키지
 ```bash
+pip install --upgrade pip
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install --upgrade pip
 pip install skl2onnx onnx onnxruntime
 pip install -r requirements.txt
 ```
@@ -36,5 +36,16 @@ python scripts/run_local.py --pretty
 
 ## 5) ONNX 추출
 ```bash
-python python scripts/export_onnx_per_target.py --model_dir models/rf_v1 --out models/multihead.onnx
+python python scripts/export_onnx.py --model_dir models/rf_v1 --out models/multihead.onnx
 ```
+
+## 6) ONNX 병합
+```bash
+python scripts\merge_onnx.py --src models\onnx_v1 --dst models\onnx_merged --out fire_all.onnx
+```
+
+## 7) json
+```bash
+python scripts\export_json.py --onnx models\onnx_merged\fire_all.onnx --model_dir models\rf_v1 --out models\onnx_merged\fire_all.meta.json
+  ```
+
